@@ -1,0 +1,11 @@
+FROM apache/james:jpa-3.8.2
+USER root
+
+RUN apt-get update \
+ && apt-get install -y openjdk-17-jre-headless vim \
+ && rm -rf /var/lib/apt/lists/*
+
+# Point JAVA_HOME and ensure the new java is first in PATH
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV PATH="$JAVA_HOME/bin:$PATH"
+

@@ -1,0 +1,33 @@
+version: "3.9"
+
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"     # AMQP
+      - "15672:15672"   # RabbitMQ UI
+
+  james:
+    build:
+      context: .                   # where your Dockerfile.jdk17 sits
+      dockerfile: Dockerfile.jdk17
+    image: my-james:jpa-3.8.2-jdk17
+    depends_on:
+      - rabbitmq
+    ports:
+      - "465:465"
+      - "587:587"
+      - "993:993"
+      - "8000:8000"
+    volumes:
+      - james-extensions:/root/extensions-jars
+      - ./conf/webadmin.properties:/root/conf/webadmin.properties
+      - ./conf/keystore:/root/conf/keystore
+      - ./conf/logback.xml:/root/conf/logback.xml           # ← add this
+      - ./conf/rabbitmq.properties:/root/conf/rabbitmq.properties
+    environment:
+        JAVA_TOOL_OPTIONS: "-Djames.configuration.path=/root/conf"
+
+volumes:
+  james-extensions:
+
