@@ -219,8 +219,8 @@ MIT – Free to use, modify, and distribute.
 
 # ✍️ Author
 
-**Ben Salem
-Apache James + Messaging Integrator**
+**Ben Salem **
+** Apache James + Messaging Integrator**
 
 
 
