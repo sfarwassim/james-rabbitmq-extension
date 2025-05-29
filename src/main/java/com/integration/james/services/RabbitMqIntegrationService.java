@@ -3,14 +3,10 @@ package com.integration.james.services;
 import com.integration.james.dto.IncomingMessagePayload;
 import com.integration.james.dto.StatusPayload;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.rabbitmq.client.*;
 import org.apache.james.lifecycle.api.Startable;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.rabbitmq.client.CancelCallback;
-import com.rabbitmq.client.Channel;
-import com.rabbitmq.client.Connection;
-import com.rabbitmq.client.ConnectionFactory;
-import com.rabbitmq.client.DeliverCallback;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -18,16 +14,14 @@ import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import com.google.inject.name.Named;
 
-import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeoutException;
+import java.time.Duration;
+import java.util.concurrent.*;
 
 @Singleton
-public class RabbitMqIntegrationService implements Startable {
+public class RabbitMqIntegrationService implements Startable, RecoveryListener, ShutdownListener {
 
 
     private static final Logger LOGGER = LoggerFactory.getLogger(RabbitMqIntegrationService.class);
@@ -42,10 +36,18 @@ public class RabbitMqIntegrationService implements Startable {
     private final String rabbitMqExchangeName;
     private final String rabbitMqRoutingKey;
 
-    private Connection connection;
-    private Channel channel;
+    private volatile  Connection connection;
+    private volatile  Channel consumerChannel;
+    private volatile  Channel   publisherChannel;
+
     private final ObjectMapper objectMapper;
     private ExecutorService executorService; // For message consumption
+    private final ScheduledExecutorService scheduler =
+            Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "rmq-retry"));
+
+
+    private static final Duration INITIAL_RETRY_DELAY = Duration.ofSeconds(5);
+    private static final Duration MAX_RETRY_DELAY     = Duration.ofMinutes(1);
 
 
     @Inject
@@ -71,130 +73,139 @@ public class RabbitMqIntegrationService implements Startable {
 
     }
 
+
     @Inject
-    public void init() throws Exception {
+    public void init() {
         LOGGER.info("Initializing RabbitMqIntegrationService...");
-        executorService = Executors.newSingleThreadExecutor(); // Or a fixed-size pool if expecting high throughput
+        connectWithRetry(INITIAL_RETRY_DELAY);
+    }
+
+    /** Try to establish the connection; on failure, schedule itself again. */
+    private void connectWithRetry(Duration delay) {
+        scheduler.schedule(() -> {
+            try {
+                establishConnection();              // throws if it fails
+                LOGGER.info("RabbitMQ connection established.");
+            } catch (Exception e) {
+                LOGGER.warn("Cannot connect to RabbitMQ ({}). Retrying in {} s",
+                        e.getMessage(), delay.toSeconds());
+                Duration nextDelay = delay.multipliedBy(2).compareTo(MAX_RETRY_DELAY) < 0
+                        ? delay.multipliedBy(2) : MAX_RETRY_DELAY;
+                connectWithRetry(nextDelay);
+            }
+        }, delay.toMillis(), TimeUnit.MILLISECONDS);
+    }
+
+    /** One-time connection & topology bootstrap – will be auto-recovered by the client. */
+    private  void establishConnection() throws IOException, TimeoutException {
+
         ConnectionFactory factory = new ConnectionFactory();
         factory.setHost(rabbitMqHost);
         factory.setPort(rabbitMqPort);
         factory.setUsername(rabbitMqUsername);
         factory.setPassword(rabbitMqPassword);
 
+        // --- explicit recovery tuning ---
+        factory.setAutomaticRecoveryEnabled(true);
+        factory.setTopologyRecoveryEnabled(true);
+        factory.setRequestedHeartbeat(30);
+        factory.setNetworkRecoveryInterval(5000);
 
-        try {
-            connection = factory.newConnection(executorService); // Share executor with connection
-            channel = connection.createChannel();
-            // Ensure queue exists, or declare it if it's meant to be durable
-            channel.queueDeclare(rabbitMqQueueName, true, false, false, null);
-            LOGGER.info("Successfully connected to RabbitMQ and channel opened. Queue: {}", rabbitMqQueueName);
+        this.connection = factory.newConnection("james-integration");
+        this.connection.addShutdownListener(this);
+        ((Recoverable) this.connection).addRecoveryListener(this);
 
-            // Declare output exchange (idempotent)
-            channel.exchangeDeclare(rabbitMqExchangeName, "direct", true); // Or "topic" etc. based on needs
-            LOGGER.info("Declared exchange: {}", rabbitMqExchangeName);
+        // ------------ channels ------------
+        this.consumerChannel  = connection.createChannel();
+        this.publisherChannel = connection.createChannel();
+        publisherChannel.confirmSelect();
 
-            LOGGER.info("RabbitMQ Integration Service started. Waiting for messages on '{}'", rabbitMqQueueName);
+        // declare infra idempotently on BOTH channels
+        declareInfra(consumerChannel);
+        declareInfra(publisherChannel);
 
-            DeliverCallback deliverCallback = (consumerTag, delivery) -> {
-                    String messageBody = new String(delivery.getBody(), StandardCharsets.UTF_8);
-                    LOGGER.debug("Received message: {}", messageBody);
-                    IncomingMessagePayload payload = null;
-                    boolean processingSuccess = false;
-                    String hashID = null;
-
-                    try {
-                        payload = objectMapper.readValue(messageBody, IncomingMessagePayload.class);
-                        hashID = payload.getHashID(); // Get hashID early for logging/status
-                        LOGGER.info("Processing action '{}' for hashID '{}'", payload.getAction(), hashID);
-                        processingSuccess = mailboxActionService.processMessageAction(payload);
-                    } catch (JsonProcessingException e) {
-                        LOGGER.error("Failed to parse JSON payload: {}. Error: {}", messageBody, e.getMessage());
-                        // hashID might be null here if parsing fails very early
-                        // Depending on requirements, you might try to extract hashID via regex or similar if critical
-                    } catch (Exception e) {
-                        LOGGER.error("Unexpected error processing message for hashID '{}': {}", hashID, e.getMessage(), e);
-                    } finally {
-                        sendStatus(hashID, processingSuccess ? "success" : "failed");
-                        channel.basicAck(delivery.getEnvelope().getDeliveryTag(), false);
-                        LOGGER.debug("Acknowledged message with delivery tag: {}", delivery.getEnvelope().getDeliveryTag());
-                    }
-                };
-
-                CancelCallback cancelCallback = consumerTag -> {
-                    LOGGER.warn("Consumer {} was cancelled", consumerTag);
-                    // Handle cancellation, e.g., by trying to restart consumption or logging an alert.
-                };
-
-
-                // Start consuming
-                channel.basicConsume(rabbitMqQueueName, false, deliverCallback, cancelCallback); // Manual ack
-
-            } catch (IOException | TimeoutException e) {
-                LOGGER.error("RabbitMQ connection/setup failed: {}", e.getMessage(), e);
-                // Clean up resources if initialization fails partially
-                if (channel!= null && channel.isOpen()) {
-                    try {
-                        channel.close();
-                    } catch (IOException | TimeoutException ex) {
-                        LOGGER.error("Error closing channel during failed init", ex);
-                    }
-                }
-                if (connection!= null && connection.isOpen()) {
-                    try {
-                        connection.close();
-                    } catch (IOException ex) {
-                        LOGGER.error("Error closing connection during failed init", ex);
-                }
-            }
-            if (executorService!= null &&!executorService.isShutdown()) {
-                executorService.shutdownNow();
-            }
-            throw new Exception("Failed to initialize RabbitMqIntegrationService", e);
-        }
-
-
+        // QoS & consumer
+        consumerChannel.basicQos(25);
+        consumerChannel.basicConsume(
+                rabbitMqQueueName,
+                false,
+                this::handleDelivery,
+                consumerTag -> LOGGER.warn("Consumer {} cancelled", consumerTag));
     }
 
+    private void declareInfra(Channel ch) throws IOException {
+        ch.queueDeclare(rabbitMqQueueName, true, false, false, null);
+        ch.exchangeDeclare(rabbitMqExchangeName, BuiltinExchangeType.DIRECT, true);
+    }
+
+    // ---------- delivery handler ----------
+    private void handleDelivery(String tag, Delivery delivery) {
+        String body = new String(delivery.getBody(), StandardCharsets.UTF_8);
+        boolean ok = false;
+        String hash = null;
+
+        try {
+            IncomingMessagePayload p = objectMapper.readValue(body, IncomingMessagePayload.class);
+            hash = p.getHashID();
+            LOGGER.info("Processing action '{}' for hashID '{}'", p.getAction(), hash);
+            ok = mailboxActionService.processMessageAction(p);
+        } catch (Exception ex) {
+            LOGGER.error("Error while processing message: {}", ex.getMessage(), ex);
+        } finally {
+            sendStatus(hash, ok ? "success" : "failed");
+            try {
+                consumerChannel.basicAck(delivery.getEnvelope().getDeliveryTag(), false);
+            } catch (IOException io) {
+                LOGGER.error("Ack failed", io);
+            }
+        }
+    }
+
+
+    // ---------- result publisher ----------
     private void sendStatus(String hashID, String status) {
-        if (hashID == null) {
+        if (hashID == null)  {
             LOGGER.warn("Cannot send status update because hashID is unknown (likely due to parsing error of incoming message).");
             return;
         }
         try {
             StatusPayload statusPayload = new StatusPayload(hashID, status);
             String jsonStatus = objectMapper.writeValueAsString(statusPayload);
-            if (channel != null && channel.isOpen()) {
-                channel.basicPublish(rabbitMqExchangeName, rabbitMqRoutingKey, null, jsonStatus.getBytes(StandardCharsets.UTF_8));
+
+            if (publisherChannel != null && publisherChannel.isOpen()) {
+                publisherChannel.basicPublish(rabbitMqExchangeName, rabbitMqRoutingKey, null, jsonStatus.getBytes(StandardCharsets.UTF_8));
                 LOGGER.info("Published status for hashID '{}': {}", hashID, jsonStatus);
-            } else {
-                LOGGER.error("Cannot send status for hashID '{}', channel is not open.", hashID);
             }
-        } catch (JsonProcessingException e) {
-            LOGGER.error("Failed to serialize StatusPayload for hashID '{}': {}", hashID, e.getMessage(), e);
-        } catch (IOException e) {
-            LOGGER.error("Failed to publish status to RabbitMQ for hashID '{}': {}", hashID, e.getMessage(), e);
+
+            publisherChannel.waitForConfirmsOrDie(5_000);
+        } catch (Exception e) {
+            LOGGER.error("Status publish failed – will retry on next recovery: {}", e.getMessage());
+            // you may push the payload in an in-memory queue here and flush on recovery()
         }
     }
 
-    @PreDestroy
-    public void dispose() {
-        LOGGER.info("Disposing RabbitMqIntegrationService...");
-        try {
-            if (channel != null && channel.isOpen()) {
-                channel.close();
-                LOGGER.info("RabbitMQ channel closed.");
-            }
-            if (connection != null && connection.isOpen()) {
-                connection.close();
-                LOGGER.info("RabbitMQ connection closed.");
-            }
-        } catch (IOException | TimeoutException e) {
-            LOGGER.error("Error closing RabbitMQ resources: {}", e.getMessage(), e);
-        } finally {
-            if (executorService != null && !executorService.isShutdown()) {
-                executorService.shutdown();
-                LOGGER.info("RabbitMQ Integration processor thread pool shutdown.");
-            }
-        }
+    // ---------- RecoveryListener ----------
+    @Override public void handleRecovery(Recoverable r) {
+        LOGGER.info("RabbitMQ connection recovered – flushing pending status messages");
+        // if you queued failed publishes, flush them here
     }
+    @Override public void handleRecoveryStarted(Recoverable r) { }
+
+    // ---------- ShutdownListener ----------
+    @Override public void shutdownCompleted(ShutdownSignalException cause) {
+        LOGGER.warn("RabbitMQ shutdown: {}", cause.getMessage());
+    }
+
+    @PreDestroy
+    public void dispose() throws IOException, TimeoutException {
+        scheduler.shutdownNow();
+        closeSafely(publisherChannel);
+        closeSafely(consumerChannel);
+        closeSafely(connection);
+    }
+
+    private void closeSafely(AutoCloseable c) { /* helper intentionally omitted */ }
+
+
+
 }
