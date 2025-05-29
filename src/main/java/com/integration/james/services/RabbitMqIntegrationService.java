@@ -2,7 +2,6 @@ package com.integration.james.services;
 
 import com.integration.james.dto.IncomingMessagePayload;
 import com.integration.james.dto.StatusPayload;
-import com.fasterxml.jackson.core.JsonProcessingException;
 import com.rabbitmq.client.*;
 import org.apache.james.lifecycle.api.Startable;
 
@@ -41,7 +40,6 @@ public class RabbitMqIntegrationService implements Startable, RecoveryListener, 
     private volatile  Channel   publisherChannel;
 
     private final ObjectMapper objectMapper;
-    private ExecutorService executorService; // For message consumption
     private final ScheduledExecutorService scheduler =
             Executors.newSingleThreadScheduledExecutor(r -> new Thread(r, "rmq-retry"));
 

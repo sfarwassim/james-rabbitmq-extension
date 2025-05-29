@@ -11,13 +11,10 @@ import com.integration.james.services.RabbitMqIntegrationService;
 import com.google.inject.name.Names;
 
 
-import org.apache.commons.configuration2.Configuration;
-import org.apache.james.utils.PropertiesProvider;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.FileNotFoundException;
-import java.io.FileReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
